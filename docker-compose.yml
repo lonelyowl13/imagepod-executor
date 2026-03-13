@@ -1,0 +1,22 @@
+services:
+  executor:
+    build: .
+    restart: unless-stopped
+    networks:
+      - imagepod
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      IMAGEPOD_API_URL: ${IMAGEPOD_API_URL}
+      IMAGEPOD_API_KEY: ${IMAGEPOD_API_KEY:?Set IMAGEPOD_API_KEY in .env or environment}
+      IMAGEPOD_POLL_TIMEOUT: ${IMAGEPOD_POLL_TIMEOUT:-20}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+
+networks:
+  imagepod:
+    driver: bridge
+    name: imagepod
