@@ -6,10 +6,13 @@ services:
       - imagepod
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./.cursor:/app/.cursor
     environment:
       IMAGEPOD_API_URL: ${IMAGEPOD_API_URL}
       IMAGEPOD_API_KEY: ${IMAGEPOD_API_KEY:?Set IMAGEPOD_API_KEY in .env or environment}
       IMAGEPOD_POLL_TIMEOUT: ${IMAGEPOD_POLL_TIMEOUT:-20}
+      IMAGEPOD_FRP_SERVER_ADDR: ${IMAGEPOD_FRP_SERVER_ADDR:-frps}
+      IMAGEPOD_DOCKER_NETWORK: ${IMAGEPOD_DOCKER_NETWORK:-imagepod}
     deploy:
       resources:
         reservations:
@@ -20,3 +23,6 @@ networks:
   imagepod:
     driver: bridge
     name: imagepod
+
+  imagepod_internal:
+    external: true

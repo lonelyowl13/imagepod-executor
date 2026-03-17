@@ -10,6 +10,8 @@ Configuration (env vars):
   IMAGEPOD_API_KEY        (required) Executor API key (from /executors/add)
   IMAGEPOD_POLL_TIMEOUT   Long-poll timeout in seconds (default: 20)
   IMAGEPOD_STATE_FILE     Optional path to JSON state file (default: ./imagepod-executor-state.json)
+  IMAGEPOD_FRP_SERVER_ADDR (required for pods with tunnels) frps hostname as resolvable from sidecars
+  IMAGEPOD_DOCKER_NETWORK Docker network name for workers and sidecars (default: imagepod). Must be the network shared with frps so sidecars can connect.
 
 Hardware (GPU, VRAM, CPU, RAM, CUDA version) is always auto-detected via
 nvidia-smi and /proc.  The executor container must be started with GPU
@@ -39,6 +41,17 @@ from state_store import StateStore
 
 log = logging.getLogger("imagepod-executor")
 
+# #region agent log
+_DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+def _debug_log(location: str, message: str, data: dict, hypothesis_id: str) -> None:
+    import json
+    try:
+        with open(_DEBUG_LOG_PATH, "a") as f:
+            f.write(json.dumps({"timestamp": int(time.time() * 1000), "location": location, "message": message, "data": data, "hypothesisId": hypothesis_id}) + "\n")
+    except Exception:
+        pass
+# #endregion
+
 DEFAULT_EXECUTION_TIMEOUT_MS = 600_000
 DEFAULT_IDLE_TIMEOUT = 5
 
@@ -63,9 +76,12 @@ class ImagePodExecutor:
         self._api_url: str = os.environ["IMAGEPOD_API_URL"].rstrip("/")
         self._api_key: str = os.environ["IMAGEPOD_API_KEY"]
         self._poll_timeout: float = float(os.environ.get("IMAGEPOD_POLL_TIMEOUT", "20"))
-        # Workers always run on a dedicated Docker network so they can reach the
-        # executor proxy and are isolated from the host network.
-        self._docker_network: str = "imagepod"
+        # FRP tunneling: frpc will connect to the configured FRP server address
+        # on the standard control port 7000.
+        self._frp_server_addr: str = os.environ["IMAGEPOD_FRP_SERVER_ADDR"]
+        self._frp_server_port: int = 7000
+        # Workers and sidecars run on this Docker network (must match executor/frps network).
+        self._docker_network: str = os.environ.get("IMAGEPOD_DOCKER_NETWORK", "imagepod")
         self._proxy_url: str = os.environ.get(
             "IMAGEPOD_EXECUTOR_PROXY_URL", DEFAULT_EXECUTOR_PROXY_URL
         ).rstrip("/")
@@ -78,6 +94,8 @@ class ImagePodExecutor:
 
         self._workers: dict[int, docker.models.containers.Container] = {}
         self._pod_containers: dict[int, docker.models.containers.Container] = {}
+        # Managed frpc sidecar containers for pod tunnels (keyed by pod id).
+        self._pod_tunnel_containers: dict[int, docker.models.containers.Container] = {}
         self._active_jobs: dict[int, TrackedJob] = {}
         self._last_activity: dict[int, float] = {}
         self._endpoint_configs: dict[int, EndpointConfig] = {}
@@ -453,6 +471,153 @@ class ImagePodExecutor:
             self._pod_started_at.pop(pod_id_str, None)
             return False
 
+    # ------------------------------------------------------------------ #
+    # Pod tunnel management (frpc sidecars)
+    # ------------------------------------------------------------------ #
+
+    def _build_frpc_config(self, pod: dict) -> str:
+        """Build frpc TOML config for all tunnels on this pod (frp v0.52+ uses TOML)."""
+        pod_id = pod.get("id")
+        tunnels = pod.get("tunnels") or []
+        if pod_id is None or not tunnels:
+            return ""
+
+        def toml_str(s: str) -> str:
+            # Escape backslash and double quote for TOML basic string
+            return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+        executor_id = pod.get("executor_id")
+        executor_key = self._api_key
+        lines: list[str] = []
+        lines.append(f'serverAddr = {toml_str(self._frp_server_addr)}')
+        lines.append(f"serverPort = {self._frp_server_port}")
+        # Global metadatas sent to frps on Login; backend plugin expects metas.executor_id and metas.executor_key
+        lines.append("[metadatas]")
+        lines.append(f"executor_id = {toml_str(str(executor_id))}")
+        lines.append(f"executor_key = {toml_str(executor_key)}")
+        lines.append("")
+
+        pod_host = f"imagepod-pod-{pod_id}"
+        
+        for t in tunnels:
+            name = f"pod-{pod_id}-{t.get('port')}"
+            local_port = t.get("port")
+            domain = t.get("domain")
+            if local_port is None or domain is None:
+                continue
+            lines.append("[[proxies]]")
+            lines.append(f"name = {toml_str(name)}")
+            # HTTP proxy: route HTTP/WS for this domain to the pod's port.
+            lines.append('type = "http"')
+            lines.append(f'localIP = {toml_str(pod_host)}')
+            lines.append(f"localPort = {local_port}")
+            lines.append(f"customDomains = [{toml_str(domain)}]")
+            lines.append("[proxies.metadatas]")
+            lines.append(f"executor_id = {toml_str(str(executor_id))}")
+            lines.append(f"executor_key = {toml_str(executor_key)}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def _start_pod_tunnels(self, pod: dict) -> None:
+        """Ensure an frpc sidecar is running for this pod's tunnels."""
+        pod_id = pod.get("id")
+        if pod_id is None:
+            return
+
+        config_text = self._build_frpc_config(pod)
+        if not config_text:
+            return
+
+        container_name = f"imagepod-frpc-pod-{pod_id}"
+
+        # Remove any existing sidecar with the same name before recreating.
+        try:
+            stale = self._docker.containers.get(container_name)
+            stale.remove(force=True)
+        except docker.errors.NotFound:
+            pass
+
+        # Run frpc in a lightweight container, mounting config via environment variable.
+        # Assumes an frpc image is available as 'ghcr.io/fatedier/frpc:v0.67.0'.
+        env = {
+            "FRPC_SERVER_ADDR": self._frp_server_addr,
+            "FRPC_SERVER_PORT": str(self._frp_server_port),
+            "FRPC_EXECUTOR_ID": str(pod.get("executor_id")),
+            "FRPC_EXECUTOR_KEY": self._api_key,
+            "FRPC_CONFIG": config_text,
+        }
+
+        # Image has ENTRYPOINT /usr/bin/frpc; override to run a shell so we can write config then run frpc.
+        # Use auto_remove=False so we can capture frpc logs if it exits.
+        run_kw: dict = {
+            "image": "ghcr.io/fatedier/frpc:v0.67.0",
+            "entrypoint": ["sh", "-c"],
+            "command": ["echo \"$FRPC_CONFIG\" > /frpc.toml && exec frpc -c /frpc.toml"],
+            "detach": True,
+            "auto_remove": False,
+            "name": container_name,
+            "environment": env,
+            "network": self._docker_network,
+        }
+
+        # #region agent log
+        _debug_log("executor.py:_start_pod_tunnels:pre_run", "About to run frpc sidecar", {"pod_id": pod_id, "container_name": container_name, "image": run_kw["image"], "config_lines": len(config_text.splitlines())}, "H1")
+        # Redact executor_key for debug log
+        _debug_log("executor.py:_start_pod_tunnels:config", "Generated frpc config (key redacted)", {"config_preview": config_text.replace(self._api_key, "<redacted>")[:2000]}, "frpc_logs")
+        # #endregion
+        try:
+            container = self._docker.containers.run(**run_kw)
+            # #region agent log
+            _debug_log("executor.py:_start_pod_tunnels:post_run", "containers.run returned", {"container_id": container.id, "short_id": container.short_id}, "H2")
+            time.sleep(2)
+            try:
+                container.reload()
+                _debug_log("executor.py:_start_pod_tunnels:reload", "Container status after 2s", {"container_id": container.id, "status": container.status}, "H1")
+                if container.status != "running":
+                    try:
+                        frpc_output = container.logs(stdout=True, stderr=True)
+                        frpc_text = frpc_output.decode("utf-8", errors="replace") if isinstance(frpc_output, bytes) else str(frpc_output)
+                        _debug_log("executor.py:_start_pod_tunnels:frpc_logs", "frpc stdout+stderr", {"frpc_logs": frpc_text[:8000]}, "frpc_logs")
+                    except Exception as e:
+                        _debug_log("executor.py:_start_pod_tunnels:frpc_logs", "Failed to get container logs", {"error": str(e)}, "frpc_logs")
+                    try:
+                        container.remove(force=True)
+                    except Exception:
+                        pass
+                    log.warning("frpc sidecar for pod %s exited; see .cursor/debug.log for frpc logs", pod_id)
+                else:
+                    self._pod_tunnel_containers[pod_id] = container
+                    log.info("Started frpc sidecar %s for pod %s", container_name, pod_id)
+            except docker.errors.NotFound:
+                _debug_log("executor.py:_start_pod_tunnels:reload", "Container already removed (exited)", {"container_id": getattr(container, "id", None)}, "H1")
+                log.warning("frpc sidecar for pod %s exited; see .cursor/debug.log for frpc logs", pod_id)
+            # #endregion
+        except docker.errors.APIError as exc:
+            # #region agent log
+            _debug_log("executor.py:_start_pod_tunnels:api_error", "containers.run failed", {"pod_id": pod_id, "error": str(exc)}, "H3")
+            # #endregion
+            log.error("Failed to start frpc sidecar for pod %s: %s", pod_id, exc)
+
+    def _stop_pod_tunnels(self, pod_id: int) -> None:
+        """Stop frpc sidecar for a pod, if present."""
+        container = self._pod_tunnel_containers.pop(pod_id, None)
+        if container is None:
+            # Attempt best-effort cleanup by name in case mapping was lost.
+            container_name = f"imagepod-frpc-pod-{pod_id}"
+            try:
+                container = self._docker.containers.get(container_name)
+            except docker.errors.NotFound:
+                return
+        name = container.name
+        try:
+            container.stop(timeout=10)
+            log.info("Stopped frpc sidecar %s (pod %d)", name, pod_id)
+        except docker.errors.NotFound:
+            log.debug("frpc sidecar for pod %d already removed", pod_id)
+        except docker.errors.APIError as exc:
+            log.warning("Error stopping frpc sidecar for pod %d: %s", pod_id, exc)
+
     def _stop_pod_container(self, pod_id: int) -> None:
         """Stop pod container; keep pod config for later start."""
         container = self._pod_containers.pop(pod_id, None)
@@ -474,6 +639,7 @@ class ImagePodExecutor:
     def _terminate_pod(self, pod_id: int) -> None:
         """Stop container and remove pod from config and persistence."""
         self._stop_pod_container(pod_id)
+        self._stop_pod_tunnels(pod_id)
         self._pod_data.pop(pod_id, None)
         self._store.remove_pod(pod_id)
 
@@ -566,12 +732,14 @@ class ImagePodExecutor:
         self._store.set_pod(pod_id, payload)
         status = (payload.get("status") or "").upper()
         if status in ("RUNNING", "STARTING", ""):
-            if self._is_pod_container_running(pod_id):
-                return True
-            self._start_pod_container(payload)
+            if not self._is_pod_container_running(pod_id):
+                self._start_pod_container(payload)
+            # Ensure tunnels are (re)started whenever the pod is running.
+            self._start_pod_tunnels(payload)
         else:
             if status in ("STOPPED", "STOPPING", "EXITED"):
                 self._stop_pod_container(pod_id)
+                self._stop_pod_tunnels(pod_id)
         return True
 
     def _handle_pod_terminated(self, entity_id: int) -> bool:
@@ -825,6 +993,8 @@ class ImagePodExecutor:
             self._stop_worker(endpoint_id)
         for pod_id in list(self._pod_containers):
             self._stop_pod_container(pod_id)
+        for pod_id in list(self._pod_tunnel_containers):
+            self._stop_pod_tunnels(pod_id)
         await self._http.aclose()
 
     async def run(self) -> None:
